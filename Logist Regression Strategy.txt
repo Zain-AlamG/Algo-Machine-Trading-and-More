@@ -1,0 +1,52 @@
+#Adapted from Hilpisch 2021
+#Logistic Regression Strategy
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import yfinance as yf
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+
+def get_data(symbol, start_date, end_date):
+    data = yf.download(symbol, start=start_date, end=end_date)
+    data['Returns'] = np.log(data['Adj Close'] / data['Adj Close'].shift(1))
+    data.dropna(inplace=True)
+    return data
+
+# Prepare lagged variables and standardize features
+def prepare_features(data, lags=3):
+    for lag in range(1, lags + 1):
+        data[f'Lag_{lag}'] = data['Returns'].shift(lag)
+    data.dropna(inplace=True)
+    scaler = StandardScaler()
+    X = scaler.fit_transform(data[[f'Lag_{i}' for i in range(1, lags + 1)]])
+    return X, data['Returns']
+
+# Fit logistic regression model
+def fit_model(X, y):
+    model = LogisticRegression()
+    y_sign = np.where(y > 0, 1, 0)  # Classify returns as 1 (up) or 0 (down)
+    model.fit(X, y_sign)
+    return model
+
+# Run the trading strategy
+def run_strategy(data, model, X, transaction_cost=0.0):
+    data['Prediction'] = model.predict(X)
+    data['Strategy'] = data['Prediction'].shift(1) * data['Returns']
+    data['Cumulative_Strategy'] = (data['Strategy'] - transaction_cost).cumsum().apply(np.exp)
+    data['Cumulative_Market'] = data['Returns'].cumsum().apply(np.exp)
+    plt.figure(figsize=(10, 6))
+    plt.plot(data.index, data['Cumulative_Strategy'], label='Strategy')
+    plt.plot(data.index, data['Cumulative_Market'], label='Market')
+    plt.legend()
+    plt.show()
+
+# Execute the strategy
+def execute_strategy(symbol='AAPL', start_date='2022-01-01', end_date='2023-01-01', lags=3, transaction_cost=0.001):
+    data = get_data(symbol, start_date, end_date)
+    X, y = prepare_features(data, lags)
+    model = fit_model(X, y)
+    run_strategy(data, model, X, transaction_cost)
+
+execute_strategy()
