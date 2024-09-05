@@ -1,0 +1,221 @@
+#Deep Q Network inspired from Stefan Jansen 2020
+#Incomplete: In Progress
+#Not inputting the things I want. Something is wrong with the data shape as well. 
+
+import warnings
+warnings.filterwarnings('ignore')
+import logging
+import optuna
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow.keras import Sequential
+from tensorflow.keras.layers import Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.regularizers import l2
+from sklearn.preprocessing import scale
+import gym
+import yfinance as yf
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+from time import time
+import random  # Import the random module
+from collections import deque  # Ensure deque is imported as well
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+np.random.seed(42)
+tf.random.set_seed(42)
+
+
+results_path = Path('results', 'trading_bot')
+if not results_path.exists():
+    results_path.mkdir(parents=True)
+
+
+trading_days = 252
+trading_cost_bps = 1e-3
+time_cost_bps = 1e-4
+
+
+def fetch_and_preprocess_data(ticker='SPY', start_date=None, end_date=None, normalize=True):
+    logger.info('Fetching data for {} from Yahoo Finance...'.format(ticker))
+    try:
+        data = yf.download(ticker, start=start_date, end=end_date)
+        data = data[['Close', 'High', 'Low', 'Volume']]
+        data.rename(columns={'Close': 'close', 'High': 'high', 'Low': 'low', 'Volume': 'volume'}, inplace=True)
+        data.dropna(inplace=True)
+        logger.info('Successfully fetched data for {}...'.format(ticker))
+    except Exception as e:
+        logger.error('Failed to fetch data for {}: {}'.format(ticker, e))
+        raise e
+
+  
+    data['returns'] = data['close'].pct_change()
+    data['ret_2'] = data['close'].pct_change(2)
+    data['ret_5'] = data['close'].pct_change(5)
+    data['ret_10'] = data['close'].pct_change(10)
+    data['ret_21'] = data['close'].pct_change(21)
+
+    data['rsi'] = data['close'].rolling(window=14).mean()
+    data['macd'] = data['close'].rolling(window=26).mean() - data['close'].rolling(window=12).mean()
+
+    data['tr'] = np.maximum((data['high'] - data['low']),
+                            np.maximum(abs(data['high'] - data['close'].shift()),
+                                       abs(data['low'] - data['close'].shift())))
+    data['atr'] = data['tr'].rolling(window=14).mean()
+
+    data['stoch'] = (data['close'] - data['low'].rolling(window=14).min()) / \
+                    (data['high'].rolling(window=14).max() - data['low'].rolling(window=14).min())
+
+    data['ultosc'] = data['close'].rolling(window=7).mean()
+
+    data = (data.replace((np.inf, -np.inf), np.nan)
+            .drop(['high', 'low', 'close', 'volume', 'tr'], axis=1)
+            .dropna())
+
+    if normalize:
+        data = pd.DataFrame(scale(data), columns=data.columns, index=data.index)
+
+    logger.info(data.info())
+    return data
+
+
+def simulate_trading(data, actions, trading_cost_bps, time_cost_bps):
+    n_steps = len(data)
+    positions = np.zeros(n_steps)
+    navs = np.ones(n_steps)
+    strategy_returns = np.zeros(n_steps)
+    costs = np.zeros(n_steps)
+
+    for step in range(1, n_steps):
+        position_change = actions[step] - positions[step-1]
+        positions[step] = actions[step]
+        costs[step] = abs(position_change) * trading_cost_bps + time_cost_bps * (position_change == 0)
+        strategy_returns[step] = positions[step-1] * data['returns'].iloc[step] - costs[step]
+        navs[step] = navs[step-1] * (1 + strategy_returns[step])
+
+    return navs, strategy_returns, costs
+
+
+def build_ddqn_model(state_dim, num_actions, architecture, learning_rate, l2_reg):
+    logger.info("Building model with architecture: %s", architecture)
+    model = Sequential()
+    for i, units in enumerate(architecture):
+        if i == 0:
+            model.add(Dense(units=units, input_dim=state_dim, activation='relu', kernel_regularizer=l2(l2_reg)))
+        else:
+            model.add(Dense(units=units, activation='relu', kernel_regularizer=l2(l2_reg)))
+    model.add(Dropout(0.1))
+    model.add(Dense(units=num_actions, name='Output'))
+    model.compile(loss='mean_squared_error', optimizer=Adam(learning_rate=learning_rate))
+    return model
+
+def epsilon_greedy_policy(model, state, epsilon, num_actions):
+    if np.random.rand() <= epsilon:
+        return np.random.choice(num_actions)
+    q_values = model.predict(state)
+    return np.argmax(q_values, axis=1).squeeze()
+
+def train_ddqn(data, state_dim, num_actions, params, max_episodes=1000):
+    model = build_ddqn_model(state_dim, num_actions, params['architecture'], params['learning_rate'], params['l2_reg'])
+    target_model = build_ddqn_model(state_dim, num_actions, params['architecture'], params['learning_rate'], params['l2_reg'])
+    target_model.set_weights(model.get_weights())
+
+    experience = deque(maxlen=params['replay_capacity'])
+    total_steps = 0
+    navs, market_navs, diffs = [], [], []
+
+    for episode in range(1, max_episodes + 1):
+        logger.info("Starting episode %d/%d", episode, max_episodes)
+        state = data.iloc[0, :].values.reshape(1, state_dim)  # Shape (1, state_dim)
+        episode_reward = 0
+
+        for step in range(1, len(data) - state_dim):
+            action = epsilon_greedy_policy(model, state, params['epsilon_start'], num_actions)
+            next_state = data.iloc[step, :].values.reshape(1, state_dim)  # Correctly reshape to (1, state_dim)
+            reward = state[0, 0] * action - params['trading_cost_bps'] * abs(action - state[0, -1])
+            done = (step == len(data) - state_dim - 1)
+
+            experience.append((state, action, reward, next_state, 0.0 if done else 1.0))
+            episode_reward += reward
+            state = next_state
+
+            if len(experience) >= params['batch_size']:
+                experience_replay(model, target_model, experience, params['batch_size'], params['gamma'], params['tau'], total_steps, [])
+
+            if done:
+                break
+
+        nav = episode_reward + 1  # Add starting NAV of 1
+        navs.append(nav)
+        diff = nav - 1  # Assume market NAV is 1
+        diffs.append(diff)
+
+    return navs, diffs
+
+def experience_replay(model, target_model, experience, batch_size, gamma, tau, steps, losses):
+    if len(experience) < batch_size:
+        logger.warning("Not enough experiences in the buffer to sample a minibatch")
+        return
+ 
+    minibatch = map(np.array, zip(*random.sample(experience, batch_size)))
+    states, actions, rewards, next_states, not_done = minibatch
+
+   
+    states = states.squeeze(axis=1)
+    next_states = next_states.squeeze(axis=1)
+
+    next_q_values = model.predict_on_batch(next_states)
+    best_actions = np.argmax(next_q_values, axis=1)
+
+    next_q_values_target = target_model.predict_on_batch(next_states)
+    target_q_values = rewards + not_done * gamma * next_q_values_target[np.arange(batch_size), best_actions]
+
+    q_values = model.predict_on_batch(states)
+    q_values[np.arange(batch_size), actions] = target_q_values
+
+    loss = model.train_on_batch(states, q_values)
+    losses.append(loss)
+
+    if steps % tau == 0:
+        target_model.set_weights(model.get_weights())
+
+
+
+
+
+data = fetch_and_preprocess_data(ticker='AAPL', start_date='2020-01-01', end_date='2022-01-01')
+
+
+state_dim = data.shape[1]
+num_actions = 3  # 0: SHORT, 1: HOLD, 2: LONG
+
+
+params = {
+    'learning_rate': 1e-3,
+    'gamma': 0.99,
+    'epsilon_start': 1.0,
+    'epsilon_end': 0.01,
+    'epsilon_decay_steps': 10000,
+    'epsilon_exponential_decay': 0.99,
+    'l2_reg': 1e-6,
+    'tau': 100,
+    'batch_size': 64,
+    'replay_capacity': 10000,
+    'architecture': (256, 256),
+    'trading_cost_bps': 1e-3,
+    'time_cost_bps': 1e-4,
+}
+
+
+navs, diffs = train_ddqn(data, state_dim, num_actions, params)
+
+
+plt.plot(navs, label='Agent NAV')
+plt.plot(np.cumsum(diffs), label='Strategy Returns')
+plt.legend()
+plt.show()
