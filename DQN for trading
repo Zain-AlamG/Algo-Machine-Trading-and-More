@@ -1,6 +1,6 @@
 #Deep Q Network inspired from Stefan Jansen 2020
 #Incomplete: In Progress
-#Not inputting the things I want. Something is wrong with the data shape as well. 
+#May have to simplify and I have to clean the data and fix many other erros on top of that. Data cleaning should not take long but fixing the network itself may take a bit. 
 
 import warnings
 warnings.filterwarnings('ignore')
